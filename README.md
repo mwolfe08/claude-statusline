@@ -5,6 +5,8 @@ A rich PowerShell status bar for [Claude Code](https://docs.anthropic.com/en/doc
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)
 
+![screenshot](screenshot.png)
+
 ## What it shows
 
 **Row 1 — Identity:** model label, working directory, current weather + forecast alerts
