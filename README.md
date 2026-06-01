@@ -63,13 +63,29 @@ A rich PowerShell status bar for [Claude Code](https://docs.anthropic.com/en/doc
 
 To disable Bible verses, delete or comment out everything from the `Get-CachedVerse` function definition to the end of the file.
 
+## Multi-account support
+
+If you run more than one Claude account (e.g. separate Pro/Max subscriptions) and switch between them with per-account [`CLAUDE_CONFIG_DIR`](https://docs.anthropic.com/en/docs/claude-code/settings) profiles, the status bar follows the **active** account automatically — the account tag and the 5h/7d quota reflect whichever account the current session is running, not whichever login happens to be in the default `~/.claude`.
+
+It works because Claude Code spawns the statusline with the session's environment, so the `-NoProfile` script still inherits `CLAUDE_CONFIG_DIR` and reads that profile's credentials + usage cache. With no `CLAUDE_CONFIG_DIR` set (a normal single-account setup) it falls back to `~/.claude` and behaves exactly as before — nothing to configure.
+
+A minimal profile switcher to pair with it (PowerShell):
+
+```powershell
+# Each profile keeps its own persisted login; sign in once per profile, then switch freely.
+function claude-work { $env:CLAUDE_CONFIG_DIR = "$env:USERPROFILE\.claude-profiles\work"; claude }
+function claude-me   { $env:CLAUDE_CONFIG_DIR = "$env:USERPROFILE\.claude-profiles\me";   claude }
+```
+
+Add each account's email domain to `$ACCOUNT_TAGS` so its tag shows in the bar.
+
 ## How it works
 
 Claude Code pipes a JSON blob to the statusline command's stdin on every render. The JSON includes model info, workspace path, transcript path, cost data, and permission mode. This script reads that JSON, enriches it with git status, token parsing, weather, and quota data, then outputs ANSI-colored lines to stdout.
 
 Caches are stored in `~/.claude/`:
 - `weather-cache.json` — 30-min TTL
-- `usage-exact.json` — 5-min TTL (file-locked to prevent concurrent refreshes)
+- `usage-exact.json` — 5-min TTL, file-locked (stored under the active `CLAUDE_CONFIG_DIR` profile when set, so quota is per-account — see [Multi-account support](#multi-account-support))
 - `verse-cache.json` / `verse-cache-yv.json` — 12-hour TTL
 
 ## Requirements
