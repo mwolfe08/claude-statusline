@@ -37,6 +37,13 @@ $tpath    = $j.transcript_path
 $permMode = $j.permission_mode; if (-not $permMode) { $permMode = 'default' }
 $style    = $j.output_style.name
 
+# Multi-account: if you run several Claude logins via separate CLAUDE_CONFIG_DIR
+# profiles, this -NoProfile statusline still inherits that env var from the session.
+# Read credentials + quota from the active profile so the account tag and 5h/7d
+# below match the RUNNING account. Falls back to the default ~/.claude for a normal
+# single-account setup, so this is a no-op unless you actually use CLAUDE_CONFIG_DIR.
+$cfgDir = if ($env:CLAUDE_CONFIG_DIR -and (Test-Path $env:CLAUDE_CONFIG_DIR)) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $env:USERPROFILE '.claude' }
+
 # Git status — branch + dirty/ahead/behind markers
 $branch = ''
 $gitMarks = ''
@@ -266,8 +273,8 @@ if ($cacheHitPct -ne $null) {
 if ($promptCount -gt 0) { $row3 += "$dim#$promptCount$reset" }
 
 # Subscription usage (5h + 7d quotas) via Anthropic OAuth endpoint. 5-min cache.
-$usageCache = Join-Path $env:USERPROFILE '.claude\usage-exact.json'
-$credPath   = Join-Path $env:USERPROFILE '.claude\.credentials.json'
+$usageCache = Join-Path $cfgDir 'usage-exact.json'
+$credPath   = Join-Path $cfgDir '.credentials.json'
 $refreshSec = 300
 
 $cacheAge = if (Test-Path $usageCache) {
