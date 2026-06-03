@@ -339,9 +339,13 @@ if ($j.cost.total_cost_usd -ne $null) {
                     if ($tail -match '^(\d+)\s') { $lastEpoch = [long]$Matches[1] }
                 }
                 if (($nowEpoch - $lastEpoch) -ge 600) {
-                    $keep = if (Test-Path $myseries) {
-                        @(Get-Content $myseries | Where-Object { $_ -match '^(\d+)\s' -and [long]$Matches[1] -ge $pruneEpoch })
-                    } else { @() }
+                    # @() must wrap the WHOLE if-expression: a single-element pipeline
+                    # result otherwise unwraps to a scalar string, so $keep += would
+                    # string-concatenate every sample onto one line (corrupting the
+                    # series — broke -Tail 1 throttling and the window parser).
+                    $keep = @(if (Test-Path $myseries) {
+                        Get-Content $myseries | Where-Object { $_ -match '^(\d+)\s' -and [long]$Matches[1] -ge $pruneEpoch }
+                    } else { @() })
                     $keep += ('{0} {1:R}' -f $nowEpoch, $costVal)
                     Set-Content -Path $myseries -Value $keep -Encoding ASCII
                 }
