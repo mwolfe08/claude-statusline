@@ -299,18 +299,23 @@ if ($j.cost.total_cost_usd -ne $null) {
         # slightly); the PID key removes the larger /clear double-count.
         $sessId = [string]$j.session_id
         if (-not $sessId) { $sessId = ($tpath -replace '[^A-Za-z0-9]', '_') }
-        # Parent claude PID is stable across /clear; session_id is not. Guard on the
-        # parent's name so we never key off a transient per-render wrapper (that would
-        # explode the file count). .Parent is pwsh 6+; CIM covers Windows PowerShell
-        # 5.1; session_id is the last-resort fallback (reverts to per-session keying).
+        # Key the cost file by the OWNING claude process PID — the one-per-terminal
+        # anchor that survives /clear, /compact and resume. The statusline's immediate
+        # parent is whatever shell claude spawned it through (bash, pwsh, cmd — varies
+        # by setup, and may be a fresh shell each render), so climb the process tree
+        # until we hit the claude/node process. CIM is used so this works in Windows
+        # PowerShell 5.1 and 7. Fall back to session_id if no claude/node ancestor is
+        # found (reverts to per-session keying).
         $procKey = $null
         try {
-            $par = (Get-Process -Id $PID).Parent
-            if (-not $par) {
-                $ppid = (Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop).ParentProcessId
-                $par  = Get-Process -Id $ppid -ErrorAction Stop
+            $cur = $PID
+            for ($i = 0; $i -lt 6; $i++) {
+                $pp = (Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ErrorAction Stop).ParentProcessId
+                if (-not $pp) { break }
+                $pn = (Get-Process -Id $pp -ErrorAction SilentlyContinue).ProcessName
+                if ($pn -match '^(claude|node)$') { $procKey = $pp; break }
+                $cur = $pp
             }
-            if ($par -and $par.ProcessName -match 'claude|node') { $procKey = $par.Id }
         } catch {}
         if (-not $procKey) { $procKey = $sessId }
         $costDir = Join-Path $env:USERPROFILE '.claude\cost-tracker'
