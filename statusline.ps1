@@ -2,7 +2,7 @@
 # https://github.com/mwolfe08/claude-statusline
 #
 # Configure the variables below, then point Claude Code at this script:
-#   Settings > statusline > command: "powershell -File C:/path/to/statusline.ps1"
+#   Settings > statusline > command: "powershell -NoProfile -File C:/path/to/statusline.ps1"
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────────────
 # Weather: set your coordinates (https://open-meteo.com) or leave empty to disable
@@ -15,6 +15,15 @@ $ACCOUNT_TAGS = @{
     # 'example.com' = 'work'
     # 'gmail.com'   = 'personal'
 }
+
+# Cost windows: show spend across four windows — session / 5h / 7d / 30d — instead
+# of a single session number. The wider windows sum per-process cost files in
+# ~/.claude\cost-tracker (see "How cost tracking works" in the README). Set to
+# $false to show just the single session "$X.XX" figure.
+$COST_WINDOWS       = $true
+# Day of the month your Anthropic plan renews. The 30d window resets at 00:00 local
+# on this day (clamped to the month length). 1 = first of the month.
+$BILLING_ANCHOR_DAY = 1
 # ────────────────────────────────────────────────────────────────────────────────
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -71,10 +80,13 @@ $limit = if ($is1m) { 1000000 } else { 200000 }
 $shortModel = $model -replace '\s*\(1M context\)\s*$', '' `
                        -replace '^Opus\s+', 'Op' `
                        -replace '^Sonnet\s+', 'So' `
-                       -replace '^Haiku\s+', 'Ha'
+                       -replace '^Haiku\s+', 'Ha' `
+                       -replace '^DeepSeek[\s-]*V?4[\s-]*Flash', 'DS4F'
 $modelLabel = if ($is1m) { "$shortModel 1M" } else { $shortModel }
 
-# Token usage — last assistant message's usage in transcript + session counters
+# Token usage — last assistant message's usage in transcript + session counters.
+# Single forward pass: counts user prompts (#N) + assistant API calls (LLM calls N)
+# while tracking the last usage-bearing line for the live token totals.
 $tokens = 0
 $cacheHitPct = $null
 $promptCount = 0
@@ -87,6 +99,9 @@ if ($tpath -and (Test-Path $tpath)) {
             $llmCount++
             $lastUsage = $line
         }
+        # Real user turn: type=user, no tool_use_id (excludes tool results),
+        # not isMeta (excludes <local-command-caveat> injections), and not
+        # the slash-command wrapper or its captured stdout.
         if ($line -match '"type":"user"' `
             -and $line -notmatch '"tool_use_id"' `
             -and $line -notmatch '"isMeta":true' `
@@ -94,6 +109,9 @@ if ($tpath -and (Test-Path $tpath)) {
             -and $line -notmatch '<local-command-stdout>') {
             $promptCount++
         }
+        # Interrupt: user typed a message while a tool was running. Stored as
+        # type=attachment with a queued_command payload; count the attachment side
+        # since that's the message actually delivered to the model.
         if ($line -match '"queued_command"') {
             $promptCount++
         }
@@ -138,7 +156,9 @@ $red="$E[31m"; $dim="$E[2m"; $magenta="$E[35m"; $reset="$E[0m"
 $orange="$E[38;5;208m"; $maroon="$E[38;5;88m"; $blue="$E[34m"
 $pipe = " $dim|$reset "
 
-# Color the bar by context pressure
+# Color the bar by context pressure.
+# 1M model: yellow at 200K (premium tier), orange/maroon climbing, red at 800K.
+# 200K model: yellow at 70%, red at 90%.
 if ($is1m) {
     $barColor = if     ($tokens -ge 800000) { $red }
                 elseif ($tokens -ge 600000) { $maroon }
@@ -260,11 +280,124 @@ if ($workMs -ne $null) {
 }
 if ($j.cost.total_cost_usd -ne $null) {
     $costVal = [double]$j.cost.total_cost_usd
-    $costColor = if ($costVal -ge 5)   { $red }
-                 elseif ($costVal -ge 1) { $yellow }
-                 else                    { $green }
-    $costStr = '{0:N2}' -f $costVal
-    $row3 += "$costColor`$$costStr$reset"
+
+    if ($COST_WINDOWS) {
+        # Four-window cost: s = process / h = 5h block / 7d / 30d (billing month).
+        # total_cost_usd is per-PROCESS cumulative — it survives /clear, /compact and
+        # resume, which mint a new session_id but keep the same claude process and its
+        # running cost. So we key each cost file by the parent claude PID, NOT
+        # session_id: one file per terminal, overwritten across clears, so the wider
+        # windows can't double-count the same spend. We sum the files whose LAST WRITE
+        # lands inside each window. Windows align to:
+        #   h   -> five_hour.resets_at   (snap to most recent boundary at/before now)
+        #   7d  -> seven_day.resets_at   (same snap, 7-day blocks)
+        #   30d -> $BILLING_ANCHOR_DAY of the month at 00:00 local (billing renewal)
+        # Cost files pool in ~/.claude\cost-tracker; resets_at is read from the active
+        # account's cache ($cfgDir), so per-account CLAUDE_CONFIG_DIR profiles stay
+        # correct. Caveat: a process counts its full cumulative cost in whichever
+        # window its last render landed (a long-lived terminal skews the older windows
+        # slightly); the PID key removes the larger /clear double-count.
+        $sessId = [string]$j.session_id
+        if (-not $sessId) { $sessId = ($tpath -replace '[^A-Za-z0-9]', '_') }
+        # Parent claude PID is stable across /clear; session_id is not. Guard on the
+        # parent's name so we never key off a transient per-render wrapper (that would
+        # explode the file count). .Parent is pwsh 6+; CIM covers Windows PowerShell
+        # 5.1; session_id is the last-resort fallback (reverts to per-session keying).
+        $procKey = $null
+        try {
+            $par = (Get-Process -Id $PID).Parent
+            if (-not $par) {
+                $ppid = (Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop).ParentProcessId
+                $par  = Get-Process -Id $ppid -ErrorAction Stop
+            }
+            if ($par -and $par.ProcessName -match 'claude|node') { $procKey = $par.Id }
+        } catch {}
+        if (-not $procKey) { $procKey = $sessId }
+        $costDir = Join-Path $env:USERPROFILE '.claude\cost-tracker'
+        $fiveHourTotal  = $costVal
+        $sevenDayTotal  = $costVal
+        $thirtyDayTotal = $costVal
+        if ($procKey) {
+            try {
+                if (-not (Test-Path $costDir)) {
+                    New-Item -ItemType Directory -Path $costDir -Force | Out-Null
+                }
+                Set-Content -Path (Join-Path $costDir "$procKey.cost") `
+                            -Value ('{0:R}' -f $costVal) -Encoding ASCII
+
+                # Each boundary recurs on a fixed grid; snap to the most recent one
+                # at/before now so even a stale resets_at anchor yields the CURRENT
+                # window instead of reaching back days and summing everything.
+                $now = Get-Date
+                $winStart5h = $now.AddHours(-5)
+                $winStart7d = $now.AddDays(-7)
+                try {
+                    $uc = Get-Content (Join-Path $cfgDir 'usage-exact.json') -Raw | ConvertFrom-Json
+                    if ($uc.five_hour.resets_at) {
+                        # NB: do not name these $reset — that's the ANSI reset escape ($E[0m).
+                        $resetAt5h  = [datetime]::Parse($uc.five_hour.resets_at)
+                        $blocks5h   = [math]::Floor((($now - $resetAt5h).TotalHours) / 5.0)
+                        $winStart5h = $resetAt5h.AddHours(5 * $blocks5h)
+                    }
+                    if ($uc.seven_day.resets_at) {
+                        $resetAt7d  = [datetime]::Parse($uc.seven_day.resets_at)
+                        $blocks7d   = [math]::Floor((($now - $resetAt7d).TotalDays) / 7.0)
+                        $winStart7d = $resetAt7d.AddDays(7 * $blocks7d)
+                    }
+                } catch {}
+
+                # 30d billing window: most recent $BILLING_ANCHOR_DAY at 00:00 local,
+                # clamped to the month length so short months never overflow.
+                $aDayNow  = [math]::Min([int]$BILLING_ANCHOR_DAY, [datetime]::DaysInMonth($now.Year, $now.Month))
+                if ($now.Day -ge $aDayNow) {
+                    $winStart30d = Get-Date -Year $now.Year -Month $now.Month -Day $aDayNow -Hour 0 -Minute 0 -Second 0
+                } else {
+                    $prev     = $now.AddMonths(-1)
+                    $aDayPrev = [math]::Min([int]$BILLING_ANCHOR_DAY, [datetime]::DaysInMonth($prev.Year, $prev.Month))
+                    $winStart30d = Get-Date -Year $prev.Year -Month $prev.Month -Day $aDayPrev -Hour 0 -Minute 0 -Second 0
+                }
+
+                # Single pass: read each file once, add to whichever windows it falls in.
+                # Prune past the widest window (30d) so the monthly sum stays whole.
+                $pruneBefore = $now.AddDays(-40)
+                $sum5h = 0.0; $sum7d = 0.0; $sum30d = 0.0
+                foreach ($f in (Get-ChildItem -Path $costDir -Filter '*.cost' -File)) {
+                    $lw = $f.LastWriteTime
+                    if ($lw -lt $pruneBefore) {
+                        Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue
+                        continue
+                    }
+                    $val = 0.0
+                    try { $val = [double]((Get-Content $f.FullName -Raw).Trim()) } catch { continue }
+                    if ($lw -ge $winStart5h)  { $sum5h  += $val }
+                    if ($lw -ge $winStart7d)  { $sum7d  += $val }
+                    if ($lw -ge $winStart30d) { $sum30d += $val }
+                }
+                if ($sum5h  -gt 0) { $fiveHourTotal  = $sum5h }
+                if ($sum7d  -gt 0) { $sevenDayTotal  = $sum7d }
+                if ($sum30d -gt 0) { $thirtyDayTotal = $sum30d }
+            } catch {}
+        }
+
+        # Per-window color, escalating thresholds (green -> yellow -> red).
+        $cS  = if ($costVal -ge 5)         { $red } elseif ($costVal -ge 1)         { $yellow } else { $green }
+        $cH  = if ($fiveHourTotal -ge 20)  { $red } elseif ($fiveHourTotal -ge 5)   { $yellow } else { $green }
+        $c7  = if ($sevenDayTotal -ge 75)  { $red } elseif ($sevenDayTotal -ge 25)  { $yellow } else { $green }
+        $c30 = if ($thirtyDayTotal -ge 300){ $red } elseif ($thirtyDayTotal -ge 150){ $yellow } else { $green }
+        $vS  = '{0:N2}' -f $costVal
+        $vH  = '{0:N2}' -f $fiveHourTotal
+        $v7  = '{0:N2}' -f $sevenDayTotal
+        $v30 = '{0:N2}' -f $thirtyDayTotal
+        # s$0.00/h$2.33/7d$23.33/30d$200.02 — labels + slashes dim, amounts colored.
+        $row3 += "${dim}s$reset$cS`$$vS$reset${dim}/h$reset$cH`$$vH$reset${dim}/7d$reset$c7`$$v7$reset${dim}/30d$reset$c30`$$v30$reset"
+    } else {
+        # Single session figure (set $COST_WINDOWS = $true for the s/h/7d/30d view).
+        $costColor = if ($costVal -ge 5)   { $red }
+                     elseif ($costVal -ge 1) { $yellow }
+                     else                    { $green }
+        $costStr = '{0:N2}' -f $costVal
+        $row3 += "$costColor`$$costStr$reset"
+    }
 }
 if ($cacheHitPct -ne $null) {
     $cacheColor = if ($cacheHitPct -ge 80) { $green } elseif ($cacheHitPct -ge 50) { $yellow } else { $red }
@@ -272,7 +405,8 @@ if ($cacheHitPct -ne $null) {
 }
 if ($promptCount -gt 0) { $row3 += "$dim#$promptCount$reset" }
 
-# Subscription usage (5h + 7d quotas) via Anthropic OAuth endpoint. 5-min cache.
+# Subscription usage (5h + 7d quotas) via the Anthropic OAuth endpoint. Cached 5 min
+# and file-locked — the endpoint is rate-limited, so don't fetch it on every render.
 $usageCache = Join-Path $cfgDir 'usage-exact.json'
 $credPath   = Join-Path $cfgDir '.credentials.json'
 $refreshSec = 300
@@ -349,20 +483,22 @@ if (Test-Path $usageCache) {
 
 if ($style -and $style -ne 'default') { $row3 += "$dim$style$reset" }
 
-if ($durPart) { $row3 += $durPart }
 $row2 = (($row2 + $row3) -join $pipe)
 $row3 = $null
 
 if ($llmCount -gt 0) { $partsBottom += "${dim}LLM calls $llmCount$reset" }
+# Duration trails the bottom row, after LLM calls.
+if ($durPart) { $partsBottom += $durPart }
 
 foreach ($row in @($row1, $row2, $row3, $partsBottom)) {
     if ($row -and $row.Count -gt 0) { Write-Output ($row -join $pipe) }
 }
 
+# Second line — context warning only
 if ($pct -ge 90) { Write-Output "$red! context $pct%$reset" }
 
 # Verse of the Day — Bible Gateway + YouVersion (both ESV). 12-hour cache; stale-on-failure.
-# Comment out or remove this section if you don't want scripture verses in your status bar.
+# Comment out or remove everything from here to the end of the file to disable verses.
 function Get-CachedVerse {
     param($cacheFile, $maxAgeSec, $fetcher)
     $age = if (Test-Path $cacheFile) {
