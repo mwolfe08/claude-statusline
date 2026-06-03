@@ -116,7 +116,9 @@ function claude-work { $env:CLAUDE_CONFIG_DIR = "$env:USERPROFILE\.claude-profil
 function claude-me   { $env:CLAUDE_CONFIG_DIR = "$env:USERPROFILE\.claude-profiles\me";   claude }
 ```
 
-Add each account's email domain to `$ACCOUNT_TAGS` so its tag shows in the bar. Cost-tracker files pool across all accounts, so the cost windows show your **total** spend regardless of which account each session used.
+Add each account's email domain to `$ACCOUNT_TAGS` so its tag shows in the bar.
+
+**One deliberate asymmetry to know about:** the account tag and the 5h/7d quota are *per active account*, but the **cost windows are not**. The cost-tracker lives in canonical `~/.claude/cost-tracker` (keyed by PID, with no account in the filename), so the `s`/5h/7d/30d figures **pool across all accounts** and show your **total** spend regardless of which account each session ran under. That's intentional — it's a single grand total, not a per-account meter, so it won't line up with any one account's invoice. If you'd rather track cost per-account, point the tracker dir at `$cfgDir` (the active `CLAUDE_CONFIG_DIR`) instead of `~/.claude` in the script.
 
 ## How it works
 
