@@ -282,30 +282,28 @@ if ($j.cost.total_cost_usd -ne $null) {
     $costVal = [double]$j.cost.total_cost_usd
 
     if ($COST_WINDOWS) {
-        # Four-window cost: s = process / h = 5h block / 7d / 30d (billing month).
-        # total_cost_usd is per-PROCESS cumulative — it survives /clear, /compact and
-        # resume, which mint a new session_id but keep the same claude process and its
-        # running cost. So we key each cost file by the parent claude PID, NOT
-        # session_id: one file per terminal, overwritten across clears, so the wider
-        # windows can't double-count the same spend. We sum the files whose LAST WRITE
-        # lands inside each window. Windows align to:
+        # Four-window cost: s = this terminal's cumulative / h = 5h / 7d / 30d spend.
+        # total_cost_usd is per-PROCESS cumulative (survives /clear, /compact, resume —
+        # those mint a new session_id but keep the same claude process and its running
+        # total). To make the wider windows mean what they say, keep a per-terminal TIME
+        # SERIES of "<epoch> <cumulative>" samples and compute
+        #     window spend = (cumulative now) - (cumulative at the window start)
+        # summed across terminals. Accurate however long a terminal stays open — the old
+        # "sum of cumulative snapshots" collapsed 5h=7d=30d for long-lived terminals.
+        # Forward-only: a window only counts spend recorded since its first sample.
+        # Window starts align to:
         #   h   -> five_hour.resets_at   (snap to most recent boundary at/before now)
         #   7d  -> seven_day.resets_at   (same snap, 7-day blocks)
         #   30d -> $BILLING_ANCHOR_DAY of the month at 00:00 local (billing renewal)
-        # Cost files pool in ~/.claude\cost-tracker; resets_at is read from the active
-        # account's cache ($cfgDir), so per-account CLAUDE_CONFIG_DIR profiles stay
-        # correct. Caveat: a process counts its full cumulative cost in whichever
-        # window its last render landed (a long-lived terminal skews the older windows
-        # slightly); the PID key removes the larger /clear double-count.
+        # Series files pool in ~/.claude\cost-tracker, one per OWNING claude PID;
+        # resets_at is read from the active account's cache ($cfgDir).
         $sessId = [string]$j.session_id
         if (-not $sessId) { $sessId = ($tpath -replace '[^A-Za-z0-9]', '_') }
-        # Key the cost file by the OWNING claude process PID — the one-per-terminal
-        # anchor that survives /clear, /compact and resume. The statusline's immediate
-        # parent is whatever shell claude spawned it through (bash, pwsh, cmd — varies
-        # by setup, and may be a fresh shell each render), so climb the process tree
-        # until we hit the claude/node process. CIM is used so this works in Windows
-        # PowerShell 5.1 and 7. Fall back to session_id if no claude/node ancestor is
-        # found (reverts to per-session keying).
+        # Key the series by the OWNING claude process PID — the one-per-terminal anchor
+        # that survives /clear/compact/resume. The statusline's immediate parent is
+        # whatever shell claude spawned it through (bash/pwsh/cmd, often respawned each
+        # render), so climb the process tree via CIM (works in PS 5.1 and 7) until the
+        # claude/node process is found. Fall back to session_id if none is found.
         $procKey = $null
         try {
             $cur = $PID
@@ -327,13 +325,30 @@ if ($j.cost.total_cost_usd -ne $null) {
                 if (-not (Test-Path $costDir)) {
                     New-Item -ItemType Directory -Path $costDir -Force | Out-Null
                 }
-                Set-Content -Path (Join-Path $costDir "$procKey.cost") `
-                            -Value ('{0:R}' -f $costVal) -Encoding ASCII
+                $now        = Get-Date
+                $nowEpoch   = [long]([DateTimeOffset]$now).ToUnixTimeSeconds()
+                $pruneEpoch = $nowEpoch - (40 * 86400)
 
-                # Each boundary recurs on a fixed grid; snap to the most recent one
-                # at/before now so even a stale resets_at anchor yields the CURRENT
-                # window instead of reaching back days and summing everything.
-                $now = Get-Date
+                # Append this terminal's current cumulative to its series, throttled to
+                # ~1 sample / 10 min, pruning samples older than 40 days. Most renders
+                # only read the last line; the file is rewritten only when adding a sample.
+                $myseries  = Join-Path $costDir "$procKey.series"
+                $lastEpoch = 0
+                if (Test-Path $myseries) {
+                    $tail = Get-Content $myseries -Tail 1
+                    if ($tail -match '^(\d+)\s') { $lastEpoch = [long]$Matches[1] }
+                }
+                if (($nowEpoch - $lastEpoch) -ge 600) {
+                    $keep = if (Test-Path $myseries) {
+                        @(Get-Content $myseries | Where-Object { $_ -match '^(\d+)\s' -and [long]$Matches[1] -ge $pruneEpoch })
+                    } else { @() }
+                    $keep += ('{0} {1:R}' -f $nowEpoch, $costVal)
+                    Set-Content -Path $myseries -Value $keep -Encoding ASCII
+                }
+
+                # Window starts. Each boundary recurs on a fixed grid; snap to the most
+                # recent one at/before now so even a stale resets_at anchor yields the
+                # CURRENT window instead of reaching back a whole extra block.
                 $winStart5h = $now.AddHours(-5)
                 $winStart7d = $now.AddDays(-7)
                 try {
@@ -361,26 +376,44 @@ if ($j.cost.total_cost_usd -ne $null) {
                     $aDayPrev = [math]::Min([int]$BILLING_ANCHOR_DAY, [datetime]::DaysInMonth($prev.Year, $prev.Month))
                     $winStart30d = Get-Date -Year $prev.Year -Month $prev.Month -Day $aDayPrev -Hour 0 -Minute 0 -Second 0
                 }
+                $e5h  = [long]([DateTimeOffset]$winStart5h).ToUnixTimeSeconds()
+                $e7d  = [long]([DateTimeOffset]$winStart7d).ToUnixTimeSeconds()
+                $e30d = [long]([DateTimeOffset]$winStart30d).ToUnixTimeSeconds()
 
-                # Single pass: read each file once, add to whichever windows it falls in.
-                # Prune past the widest window (30d) so the monthly sum stays whole.
-                $pruneBefore = $now.AddDays(-40)
+                # Sum each window across every terminal's series:
+                #   spend = (latest cumulative) - (cumulative at/just-before the start).
+                # No sample at/before the start => the terminal began inside the window,
+                # so its baseline is its first sample. Negatives (a counter reset) clamp
+                # to 0. This terminal uses its live value; others use their last sample.
                 $sum5h = 0.0; $sum7d = 0.0; $sum30d = 0.0
-                foreach ($f in (Get-ChildItem -Path $costDir -Filter '*.cost' -File)) {
-                    $lw = $f.LastWriteTime
-                    if ($lw -lt $pruneBefore) {
-                        Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue
+                foreach ($sf in (Get-ChildItem -Path $costDir -Filter '*.series' -File)) {
+                    $eps = New-Object System.Collections.ArrayList
+                    $cms = New-Object System.Collections.ArrayList
+                    try {
+                        foreach ($ln in (Get-Content $sf.FullName)) {
+                            if ($ln -match '^(\d+)\s+([0-9.]+)') { [void]$eps.Add([long]$Matches[1]); [void]$cms.Add([double]$Matches[2]) }
+                        }
+                    } catch { continue }
+                    if ($eps.Count -eq 0) { continue }
+                    if ($eps[$eps.Count - 1] -lt $pruneEpoch) {
+                        Remove-Item $sf.FullName -Force -ErrorAction SilentlyContinue
                         continue
                     }
-                    $val = 0.0
-                    try { $val = [double]((Get-Content $f.FullName -Raw).Trim()) } catch { continue }
-                    if ($lw -ge $winStart5h)  { $sum5h  += $val }
-                    if ($lw -ge $winStart7d)  { $sum7d  += $val }
-                    if ($lw -ge $winStart30d) { $sum30d += $val }
+                    $latest = if ($sf.BaseName -eq "$procKey") { $costVal } else { $cms[$cms.Count - 1] }
+                    $b5 = $cms[0]; $b7 = $cms[0]; $b30 = $cms[0]
+                    for ($k = 0; $k -lt $eps.Count; $k++) {
+                        $ek = $eps[$k]; $ck = $cms[$k]
+                        if ($ek -le $e5h)  { $b5  = $ck }
+                        if ($ek -le $e7d)  { $b7  = $ck }
+                        if ($ek -le $e30d) { $b30 = $ck }
+                    }
+                    $sum5h  += [math]::Max(0.0, $latest - $b5)
+                    $sum7d  += [math]::Max(0.0, $latest - $b7)
+                    $sum30d += [math]::Max(0.0, $latest - $b30)
                 }
-                if ($sum5h  -gt 0) { $fiveHourTotal  = $sum5h }
-                if ($sum7d  -gt 0) { $sevenDayTotal  = $sum7d }
-                if ($sum30d -gt 0) { $thirtyDayTotal = $sum30d }
+                $fiveHourTotal  = $sum5h
+                $sevenDayTotal  = $sum7d
+                $thirtyDayTotal = $sum30d
             } catch {}
         }
 

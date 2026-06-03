@@ -86,19 +86,21 @@ Claude Code reports `cost.total_cost_usd` to the statusline. Two things about th
 
 **1. It's per *process*, not per session.** `total_cost_usd` accumulates for the life of the running `claude` process and **survives `/clear`, `/compact`, and resume** — each of those mints a new `session_id` but keeps the same process and its running total. So the **`s` (session) figure does not reset to $0 after a `/clear`** — it reflects everything that terminal has spent since launch. That's expected, not a bug.
 
-**2. The wider windows must be keyed by process, not session.** For the 5h / 7d / 30d sums, each render writes the current cost to a small file under `~/.claude/cost-tracker/`, and one pass sums the files whose last-write time falls inside each window (files pool across accounts; pruned past 40 days). The trap: if you key those files by `session_id`, every `/clear` leaves a **stale file holding the carried-over cumulative cost**, and the next session writes essentially the same total again — so the windows **double-count** the same spend (once per `/clear`).
+**2. The wider windows need real time accounting, not cumulative snapshots.** A naive tracker writes each terminal's *cumulative* cost to a file and sums the files inside each window — but the file is stamped at the last render (≈ now), so a terminal you keep open dumps its whole running total into *every* window at once, collapsing `5h = 7d = 30d`. Instead, each terminal keeps a small **time series** of `<epoch> <cumulative>` samples (one per ~10 min, pruned past 40 days), and a window's spend is:
 
-The fix is to key each file by the **owning `claude` process PID** instead of `session_id`. One file per terminal, overwritten across `/clear` — so the carried-over cost is counted once. Resolving that PID takes some care: the statusline's *immediate* parent is whatever shell Claude Code spawned it through (bash, pwsh, cmd — and often a **fresh shell each render**), so the script walks **up** the process tree — via a `Win32_Process` CIM lookup that works in both Windows PowerShell 5.1 and 7 — until it reaches the `claude`/`node` process, and keys on that. If no such ancestor is found it falls back to `session_id` (the old per-session behavior).
+```
+window spend = (cumulative now) − (cumulative at the window's start)
+```
+
+summed across terminals. That's accurate no matter how long a terminal stays open, and the windows actually diverge. A terminal that began *inside* a window uses its first sample as the baseline; a closed terminal still contributes whatever it spent before it stopped.
+
+**Keying.** Series files live in `~/.claude/cost-tracker/`, one per terminal, named by the **owning `claude` process PID** (stable across `/clear`/`/compact`/resume; files pool across accounts). Resolving that PID takes care: the statusline's *immediate* parent is whatever shell Claude Code spawned it through (bash, pwsh, cmd — often a **fresh shell each render**), so the script walks **up** the process tree — via a `Win32_Process` CIM lookup that works in both Windows PowerShell 5.1 and 7 — until it reaches the `claude`/`node` process. Falls back to `session_id` if none is found.
 
 **Window boundaries:** the 5h and 7d windows snap to the real `resets_at` reported by the OAuth usage cache (`usage-exact.json`), advanced forward by whole blocks to the most recent boundary at/before now (so a stale anchor still yields the *current* window). The 30d window resets at 00:00 local on `$BILLING_ANCHOR_DAY`.
 
-**Caveat:** a long-lived terminal still counts its full cumulative cost in whichever window its last render landed, so the older windows can skew slightly high. Removing that entirely would need per-render delta tracking; PID-keying removes the much larger `/clear` double-count.
+**Forward-only.** A window can only count spend recorded since its first sample, so on a fresh install (or after clearing the tracker) the windows start near $0 and fill in — the 5h becomes a true rolling 5h after ~5h of uptime, the 30d over the month. Past spend isn't reconstructed (Claude Code transcripts don't store per-message cost); for historical totals, see your Anthropic usage/billing console.
 
-> Migrating from an older copy that keyed by `session_id`? Old files linger until they age out (5h self-corrects within ~5h, 7d within a week). To reset immediately, delete the non-numeric (GUID-named) files and keep the numeric (PID) ones:
-> ```powershell
-> Get-ChildItem "$env:USERPROFILE\.claude\cost-tracker\*.cost" |
->   Where-Object { $_.BaseName -notmatch '^\d+$' } | Remove-Item
-> ```
+> To reset the windows, just delete the series files: `Remove-Item "$env:USERPROFILE\.claude\cost-tracker\*.series"`. They rebuild from the next render onward.
 
 ## Multi-account support
 
@@ -121,7 +123,7 @@ Add each account's email domain to `$ACCOUNT_TAGS` so its tag shows in the bar. 
 Claude Code pipes a JSON blob to the statusline command's stdin on every render. The JSON includes model info, workspace path, transcript path, cost data, and permission mode. This script reads that JSON, enriches it with git status, token parsing, cost windows, weather, and quota data, then outputs ANSI-colored lines to stdout.
 
 Caches and state are stored under `~/.claude/`:
-- `cost-tracker/<pid>.cost` — one tiny file per `claude` process; summed for the 5h/7d/30d windows (see [How cost tracking works](#how-cost-tracking-works))
+- `cost-tracker/<pid>.series` — a small cost time series per `claude` process; differenced for the 5h/7d/30d windows (see [How cost tracking works](#how-cost-tracking-works))
 - `weather-cache.json` — 30-min TTL
 - `usage-exact.json` — 5-min TTL, file-locked (stored under the active `CLAUDE_CONFIG_DIR` profile when set, so quota is per-account — see [Multi-account support](#multi-account-support))
 - `verse-cache.json` / `verse-cache-yv.json` — 12-hour TTL
