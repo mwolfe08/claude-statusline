@@ -304,17 +304,50 @@ if ($j.cost.total_cost_usd -ne $null) {
         # whatever shell claude spawned it through (bash/pwsh/cmd, often respawned each
         # render), so climb the process tree via CIM (works in PS 5.1 and 7) until the
         # claude/node process is found. Fall back to session_id if none is found.
-        $procKey = $null
-        try {
-            $cur = $PID
-            for ($i = 0; $i -lt 6; $i++) {
-                $pp = (Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ErrorAction Stop).ParentProcessId
-                if (-not $pp) { break }
-                $pn = (Get-Process -Id $pp -ErrorAction SilentlyContinue).ProcessName
-                if ($pn -match '^(claude|node)$') { $procKey = $pp; break }
-                $cur = $pp
+        #
+        # That CIM climb costs ~600 ms under Windows PowerShell 5.1 — by far the most
+        # expensive thing a render does — and the answer is constant for a session, so
+        # cache it per session_id and reuse it while the cached PID is still a live
+        # claude/node process. Only the first render of a session (or one whose cached
+        # PID has died) pays the walk; the rest do a ~5 ms file read + liveness check.
+        $procKey  = $null
+        $pkCache  = Join-Path $env:USERPROFILE '.claude\prockey-cache.json'
+        $pkMap    = $null
+        if (Test-Path $pkCache) { try { $pkMap = Get-Content $pkCache -Raw | ConvertFrom-Json } catch {} }
+        if ($pkMap -and $pkMap.$sessId) {
+            $cachedPid = [int]$pkMap.$sessId.pid
+            if ((Get-Process -Id $cachedPid -ErrorAction SilentlyContinue).ProcessName -match '^(claude|node)$') {
+                $procKey = $cachedPid
             }
-        } catch {}
+        }
+        if (-not $procKey) {
+            try {
+                $cur = $PID
+                for ($i = 0; $i -lt 6; $i++) {
+                    $pp = (Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ErrorAction Stop).ParentProcessId
+                    if (-not $pp) { break }
+                    $pn = (Get-Process -Id $pp -ErrorAction SilentlyContinue).ProcessName
+                    if ($pn -match '^(claude|node)$') { $procKey = $pp; break }
+                    $cur = $pp
+                }
+            } catch {}
+            # Write through to the per-session cache, dropping entries older than 2 days
+            # so this file can't grow without bound the way the .series dir did. A corrupt
+            # or lost write just costs the next render another walk (self-healing).
+            if ($procKey) {
+                try {
+                    $pkNow = [long]([DateTimeOffset](Get-Date)).ToUnixTimeSeconds()
+                    $pkNew = @{}
+                    if ($pkMap) {
+                        foreach ($pkEnt in $pkMap.PSObject.Properties) {
+                            if ($pkEnt.Value.ts -and ([long]$pkEnt.Value.ts) -ge ($pkNow - 172800)) { $pkNew[$pkEnt.Name] = $pkEnt.Value }
+                        }
+                    }
+                    $pkNew[$sessId] = @{ pid = $procKey; ts = $pkNow }
+                    $pkNew | ConvertTo-Json -Compress | Set-Content -Path $pkCache -Encoding ASCII
+                } catch {}
+            }
+        }
         if (-not $procKey) { $procKey = $sessId }
         $costDir = Join-Path $env:USERPROFILE '.claude\cost-tracker'
         $fiveHourTotal  = $costVal
@@ -327,10 +360,10 @@ if ($j.cost.total_cost_usd -ne $null) {
                 }
                 $now        = Get-Date
                 $nowEpoch   = [long]([DateTimeOffset]$now).ToUnixTimeSeconds()
-                $pruneEpoch = $nowEpoch - (40 * 86400)
+                $pruneEpoch = $nowEpoch - (32 * 86400)   # > widest displayed window (30d) + margin
 
                 # Append this terminal's current cumulative to its series, throttled to
-                # ~1 sample / 10 min, pruning samples older than 40 days. Most renders
+                # ~1 sample / 10 min, pruning samples older than 32 days. Most renders
                 # only read the last line; the file is rewritten only when adding a sample.
                 $myseries  = Join-Path $costDir "$procKey.series"
                 $lastEpoch = 0
@@ -399,21 +432,43 @@ if ($j.cost.total_cost_usd -ne $null) {
                         }
                     } catch { continue }
                     if ($eps.Count -eq 0) { continue }
-                    if ($eps[$eps.Count - 1] -lt $pruneEpoch) {
+                    # Keep the directory (and thus every render's I/O) bounded by pruning
+                    # files that can no longer affect any window. Two cases contribute
+                    # nothing yet still cost an open+read each render in every session:
+                    #   - samples entirely past the widest (30d) window, and
+                    #   - a lone sample from a dead PID: baseline == latest => $0 in every
+                    #     window. Without this, one file per process accumulates with no
+                    #     effective cap, slowing renders until the host cancels the
+                    #     in-flight script and the status line blanks.
+                    # Skip the current PID's own file; give a just-started session 1200s
+                    # (2x the 600s sample throttle) before its still-single-sample file
+                    # is treated as dead.
+                    $lastEp = $eps[$eps.Count - 1]
+                    if (($sf.BaseName -ne "$procKey") -and (
+                            $lastEp -lt $pruneEpoch -or
+                            ($eps.Count -le 1 -and $lastEp -lt ($nowEpoch - 1200)))) {
                         Remove-Item $sf.FullName -Force -ErrorAction SilentlyContinue
                         continue
                     }
-                    $latest = if ($sf.BaseName -eq "$procKey") { $costVal } else { $cms[$cms.Count - 1] }
-                    $b5 = $cms[0]; $b7 = $cms[0]; $b30 = $cms[0]
-                    for ($k = 0; $k -lt $eps.Count; $k++) {
-                        $ek = $eps[$k]; $ck = $cms[$k]
-                        if ($ek -le $e5h)  { $b5  = $ck }
-                        if ($ek -le $e7d)  { $b7  = $ck }
-                        if ($ek -le $e30d) { $b30 = $ck }
+                    # Per-window spend = sum of POSITIVE deltas between consecutive samples
+                    # whose later sample falls in the window. For a clean monotonic series
+                    # this equals (latest - cumulative at the window start) — identical to a
+                    # baseline subtraction — but it also tolerates a cumulative DROP inside a
+                    # file: when the OS recycles a PID, this file holds the dead process's
+                    # high cumulative followed by the new process's low one, and a plain
+                    # (latest - baseline) silently undercounts (or zeroes) the whole file.
+                    # Clamping each delta at 0 treats the recycled run as its own baseline.
+                    # The current PID's own file appends the live costVal as a final virtual
+                    # sample so spend since the last 10-min write is counted.
+                    $epsA = $eps.ToArray(); $cmsA = $cms.ToArray()
+                    if ($sf.BaseName -eq "$procKey") { $epsA += $nowEpoch; $cmsA += [double]$costVal }
+                    for ($k = 1; $k -lt $epsA.Count; $k++) {
+                        $d = $cmsA[$k] - $cmsA[$k - 1]
+                        if ($d -le 0) { continue }
+                        if ($epsA[$k] -gt $e5h)  { $sum5h  += $d }
+                        if ($epsA[$k] -gt $e7d)  { $sum7d  += $d }
+                        if ($epsA[$k] -gt $e30d) { $sum30d += $d }
                     }
-                    $sum5h  += [math]::Max(0.0, $latest - $b5)
-                    $sum7d  += [math]::Max(0.0, $latest - $b7)
-                    $sum30d += [math]::Max(0.0, $latest - $b30)
                 }
                 $fiveHourTotal  = $sum5h
                 $sevenDayTotal  = $sum7d
