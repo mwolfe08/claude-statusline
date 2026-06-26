@@ -9,8 +9,17 @@
 $WEATHER_LAT  = ''   # e.g. '40.7128'
 $WEATHER_LON  = ''   # e.g. '-74.0060'
 
-# Account tags: map email domain suffixes to short labels shown in the status bar.
-# The script reads the logged-in account email from the Anthropic OAuth cache.
+# Account tags: short label shown for the logged-in account. Matched FIRST by the
+# active CLAUDE_CONFIG_DIR profile folder name (handy if you run several logins via
+# separate profile dirs — e.g. an account switcher), then as a fallback by email
+# domain suffix from the Anthropic OAuth cache. The profile-folder match wins because
+# multiple accounts can share one domain (e.g. several gmail.com logins) that a
+# domain-only match can't tell apart. Leave both maps empty to show no tag.
+$PROFILE_TAGS = @{
+    # 'work'     = 'wk'    # %USERPROFILE%\.claude-profiles\work
+    # 'personal' = 'me'
+    # '.claude'  = 'me'    # the default config dir (no CLAUDE_CONFIG_DIR set)
+}
 $ACCOUNT_TAGS = @{
     # 'example.com' = 'work'
     # 'gmail.com'   = 'personal'
@@ -476,8 +485,12 @@ $partsBottom = @()
 if (Test-Path $usageCache) {
     try {
         $u = Get-Content $usageCache -Raw | ConvertFrom-Json
-        if ($u._email -and $ACCOUNT_TAGS.Count -gt 0) {
-            $tag = $null
+        # Tag the active account. Prefer the CLAUDE_CONFIG_DIR profile folder name
+        # (account switcher), then fall back to email-domain matching.
+        $tag = $null
+        $cfgLeaf = Split-Path -Leaf $cfgDir
+        if ($PROFILE_TAGS.ContainsKey($cfgLeaf)) { $tag = $PROFILE_TAGS[$cfgLeaf] }
+        if (-not $tag -and $u._email -and $ACCOUNT_TAGS.Count -gt 0) {
             foreach ($domain in $ACCOUNT_TAGS.Keys) {
                 if ($u._email -match [regex]::Escape($domain) + '$') {
                     $tag = $ACCOUNT_TAGS[$domain]
@@ -485,8 +498,8 @@ if (Test-Path $usageCache) {
                 }
             }
             if (-not $tag) { $tag = ($u._email -split '@')[0] }
-            $partsBottom += "$magenta$tag$reset"
         }
+        if ($tag) { $partsBottom += "$magenta$tag$reset" }
         if ($u.five_hour -and $u.five_hour.utilization -ne $null) {
             $bp = [int]$u.five_hour.utilization
             $bc = if ($bp -ge 80) { $red } elseif ($bp -ge 50) { $yellow } else { $green }

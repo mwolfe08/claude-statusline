@@ -37,7 +37,11 @@ A rich PowerShell status bar for [Claude Code](https://docs.anthropic.com/en/doc
    $WEATHER_LAT  = '40.7128'   # your latitude  (empty = no weather)
    $WEATHER_LON  = '-74.0060'  # your longitude
 
-   $ACCOUNT_TAGS = @{
+   $PROFILE_TAGS = @{          # matched by CLAUDE_CONFIG_DIR profile folder (wins)
+       'work'     = 'wk'       # %USERPROFILE%\.claude-profiles\work
+       'personal' = 'me'
+   }
+   $ACCOUNT_TAGS = @{          # fallback: matched by email domain suffix
        'yourcompany.com' = 'work'
        'gmail.com'       = 'me'
    }
@@ -66,7 +70,8 @@ All configuration is the `CONFIG` block at the top of the script — no other ed
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `$WEATHER_LAT` / `$WEATHER_LON` | Coordinates for weather. Leave empty to disable. | `''` (disabled) |
-| `$ACCOUNT_TAGS` | Map email-domain suffixes → short labels. Unmatched accounts show the email's username. | `@{}` |
+| `$PROFILE_TAGS` | Map `CLAUDE_CONFIG_DIR` profile-folder names → short labels. Checked **before** `$ACCOUNT_TAGS`; reliably distinguishes accounts that share an email domain. Use `.claude` for the default config dir. | `@{}` |
+| `$ACCOUNT_TAGS` | Fallback: map email-domain suffixes → short labels. Unmatched accounts show the email's username. | `@{}` |
 | `$COST_WINDOWS` | `$true` = session/5h/7d/30d windows; `$false` = single session figure. | `$true` |
 | `$BILLING_ANCHOR_DAY` | Day of month your plan renews; the 30d window resets at 00:00 local on it (clamped to month length). | `1` |
 
@@ -116,7 +121,7 @@ function claude-work { $env:CLAUDE_CONFIG_DIR = "$env:USERPROFILE\.claude-profil
 function claude-me   { $env:CLAUDE_CONFIG_DIR = "$env:USERPROFILE\.claude-profiles\me";   claude }
 ```
 
-Add each account's email domain to `$ACCOUNT_TAGS` so its tag shows in the bar.
+Add each profile-folder name to `$PROFILE_TAGS` (e.g. `'work' = 'wk'`) so its tag shows in the bar. This is matched ahead of `$ACCOUNT_TAGS` and works even when several accounts share an email domain (e.g. multiple `gmail.com` logins), which a domain-only match can't distinguish.
 
 **One deliberate asymmetry to know about:** the account tag and the 5h/7d quota are *per active account*, but the **cost windows are not**. The cost-tracker lives in canonical `~/.claude/cost-tracker` (keyed by session, with no account in the filename), so the `s`/5h/7d/30d figures **pool across all accounts** and show your **total** spend regardless of which account each session ran under. That's intentional — it's a single grand total, not a per-account meter, so it won't line up with any one account's invoice. If you'd rather track cost per-account, point the tracker dir at `$cfgDir` (the active `CLAUDE_CONFIG_DIR`) instead of `~/.claude` in the script.
 
