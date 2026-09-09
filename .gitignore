@@ -1,0 +1,12 @@
+*.json
+*.bak-*
+
+# Built artifacts. The binary is NOT committed on purpose: publish-public.ps1
+# hash-pins every binary in the publish tree so a human has to re-review it, and a
+# binary that changes on every `go build` would abort every publish run. The public
+# mirror ships buildable source; install.ps1 compiles it.
+native/statusline.exe
+native/*.exe
+
+# The sample config IS committed - it is the public template, with no real values.
+!native/statusline-config.sample.json

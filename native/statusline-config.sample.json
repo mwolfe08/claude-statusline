@@ -1,0 +1,24 @@
+{
+  "_comment": "Copy to <USERPROFILE>/.claude/statusline-config.json and edit. These are the CONFIG knobs that used to live at lines 6-50 of statusline.ps1; the binary carries no personal values at all, which is why the same bytes can ship to a public mirror.",
+
+  "_weather": "Open-Meteo coordinates for the forecast (its timezone is auto-resolved from them). Leave EITHER value blank to disable weather.",
+  "weather_lat": "",
+  "weather_lon": "",
+
+  "_tags": "Account tag on the bottom row. profile_tags is matched FIRST, by CLAUDE_CONFIG_DIR profile-folder name; account_tags is the fallback, by email-domain suffix; no match falls back to the email's username. A 2nd seat on an org already in account_tags MUST be listed in profile_tags - it shares the first seat's domain, so the domain fallback would resolve both to one tag and the two sessions would be indistinguishable.",
+  "profile_tags": {},
+  "account_tags": { "gmail.com": "me" },
+
+  "_cost": "cost_windows true renders the four-window view s/h/7d/30d, pooling spend across every session via the cost-tracker dir; false renders only this session's figure and skips the tracker entirely (no files written). billing_anchor_day is the day of the month the plan renews - the 30d window resets at 00:00 local on it, clamped to the month's length.",
+  "cost_windows": true,
+  "billing_anchor_day": 1,
+
+  "_cache": "Prompt-cache countdown chip. Claude Code caches the conversation's prompt prefix with a 1-hour TTL that every main-chain API call refreshes; warm it re-reads at 0.1x input price, lapsed the next turn rewrites the whole prefix at 2x. cache_ttl_min 0 hides the chip. TRAP: under usage overage Anthropic drops the TTL to 5 min - the chip DETECTS that from usage.cache_creation and tags itself (5m), so this value is only the pre-write default.",
+  "cache_ttl_min": 60,
+  "cache_warn_min": 15,
+  "cache_crit_min": 6,
+
+  "_verses": "Bible Gateway is requested as ESV. YouVersion serves its default translation, currently NIV, and cannot be pinned: adding ?version=<id> returns a bot-protection page, so only the unparameterised URL works. Each line is labelled with what it actually carries.",
+  "verse_youversion": true,
+  "verse_biblegateway": true
+}
